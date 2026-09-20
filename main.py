@@ -2,7 +2,6 @@ import logging
 import os
 import threading
 import requests
-import json
 from flask import Flask
 import google.generativeai as genai
 from telegram import Update
@@ -38,25 +37,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     
     if "instagram.com" in text:
-        username = text.split("instagram.com/")[-1].replace("/", "").split("?")[0].strip()
+        username = text.split("instagram.com/")[ -1].replace("/", "").split("?")[0].strip()
     else:
         username = text.replace("@", "").strip()
         
     await update.message.reply_text(f"🔎 '@{username}' profilinin məlumatları çəkilir və AI analiz edir. Xahiş olunur gözləyin...")
     
     try:
-        url = "https://instagram-scraper-stable-api.p.rapidapi.com/get_ig_user_posts_v2.php"
-        payload = f"username_or_url={username}"
+        url = "https://instagram-scraper-stable-api.p.rapidapi.com/user_posts.php"
+        querystring = {"username_or_id_or_url": username}
+        
         headers = {
-            'Content-Type': 'application/x-www-form-urlencoded',
             'x-rapidapi-host': 'instagram-scraper-stable-api.p.rapidapi.com',
             'x-rapidapi-key': RAPIDAPI_KEY
         }
 
-        api_response = requests.post(url, data=payload, headers=headers)
+        api_response = requests.get(url, headers=headers, params=querystring)
         res_data = api_response.json()
-        
-        logging.info(f"API Response: {res_data}")
 
         posts_data = []
         
@@ -92,8 +89,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             })
 
         if not posts_data:
-            err_msg = json.dumps(res_data, indent=2)[:3000]
-            await update.message.reply_text(f"⚠️ RapidAPI Cavabı:\n\n{err_msg}")
+            await update.message.reply_text("❌ Məlumat tapılmadı və ya profil gizlidir. Başqa istifadəçi adı yoxlayın.")
             return
 
         prompt = (
