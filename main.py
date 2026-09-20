@@ -66,7 +66,7 @@ LINE = "━━━━━━━━━━━━━━━"
 def author_line() -> str:
     if not (AUTHOR_NAME or AUTHOR_TELEGRAM):
         return ""
-    line = "\n\n👨‍💻 Hazırlayan: " + (AUTHOR_NAME or f"@{AUTHOR_TELEGRAM}")
+    line = "👨‍💻 Hazırlayan: " + (AUTHOR_NAME or f"@{AUTHOR_TELEGRAM}")
     if AUTHOR_NAME and AUTHOR_TELEGRAM:
         line += f" (@{AUTHOR_TELEGRAM})"
     return line
@@ -316,28 +316,78 @@ async def gemini_raw(prompt: str) -> str:
     return resp.text
 
 
-async def send_long(message, text: str, reply_markup=None):
-    chunks = [text[i : i + 4000] for i in range(0, len(text), 4000)] or [""]
-    for idx, chunk in enumerate(chunks):
+async def send_blocks(message, blocks, reply_markup=None, limit=3900):
+    """Blokları Telegram limitinə görə mesajlara yığır, düymələr sonuncuda olur."""
+    chunks, current = [], ""
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        while len(block) > limit:  # çox nadir: tək blok limiti keçirsə
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(block[:limit])
+            block = block[limit:]
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
+    for idx, chunk in enumerate(chunks or [""]):
         markup = reply_markup if idx == len(chunks) - 1 else None
         await message.reply_text(chunk, reply_markup=markup)
 
 
-# ---------------- Hesabat kartı ----------------
-SECTIONS = [
-    ("best", "🔥 Uğurlu postlar", "🔥 ƏN UĞURLU POSTLAR"),
-    ("weak", "📉 Zəif postlar", "📉 ZƏİF POSTLAR"),
-    ("audience", "💬 Auditoriya", "💬 AUDİTORİYA REAKSİYASI"),
-    ("strategy", "📸 Strategiya", "📸 KONTENT STRATEGİYASI"),
-    ("tips", "💡 Tövsiyələr", "💡 TÖVSİYƏLƏR"),
-]
+async def send_long(message, text: str, reply_markup=None):
+    await send_blocks(message, text.split("\n\n"), reply_markup)
 
 
+# ---------------- Hesabat ----------------
 def fmt(n) -> str:
     try:
         return f"{int(n):,}".replace(",", " ")
     except Exception:
         return str(n)
+
+
+def short_caption(caption: str, n: int = 70) -> str:
+    c = " ".join((caption or "").split())
+    if not c:
+        return "mətnsiz post"
+    return c[:n] + ("…" if len(c) > n else "")
+
+
+def pick_posts(posts):
+    """Bəyənməyə görə ən yaxşı və ən zəif postların indekslərini seçir."""
+    n = len(posts)
+    order = sorted(range(n), key=lambda i: posts[i]["likes"], reverse=True)
+    k = max(1, min(2, n // 2))
+    best = order[:k]
+    weak = [i for i in reversed(order) if i not in best][:k]
+    return best, weak
+
+
+def _clean_list(value, limit):
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [str(i).strip() for i in value if str(i).strip()][:limit]
+
+
+def _clean_entries(value):
+    if not isinstance(value, list):
+        return []
+    out = []
+    for e in value:
+        if isinstance(e, dict):
+            out.append(e)
+    return out
 
 
 def parse_report(text: str):
@@ -351,78 +401,118 @@ def parse_report(text: str):
     except Exception:
         return None
 
+    try:
+        score = max(1, min(10, int(data.get("score", 0))))
+    except Exception:
+        score = 0
+
     report = {
         "niche": str(data.get("niche", "")).strip() or "Müəyyən edilmədi",
         "summary": str(data.get("summary", "")).strip(),
-        "score": 0,
-        "sections": {},
+        "score": score,
+        "best": _clean_entries(data.get("best")),
+        "weak": _clean_entries(data.get("weak")),
+        "audience": _clean_list(data.get("audience"), 4),
+        "strategy": _clean_list(data.get("strategy"), 4),
+        "tips": _clean_list(data.get("tips"), 5),
     }
-    try:
-        report["score"] = max(1, min(10, int(data.get("score", 0))))
-    except Exception:
-        report["score"] = 0
-
-    for key, _, _ in SECTIONS:
-        items = data.get(key, [])
-        if isinstance(items, str):
-            items = [items]
-        if not isinstance(items, list):
-            items = []
-        items = [str(i).strip() for i in items if str(i).strip()][:5]
-        report["sections"][key] = items
-
-    if not any(report["sections"].values()):
+    if not (report["best"] or report["weak"] or report["tips"]):
         return None
     return report
 
 
-def build_card(username, posts, report) -> str:
+def find_entry(entries, post_no, fallback_idx):
+    for e in entries:
+        try:
+            if int(e.get("post")) == post_no:
+                return e
+        except Exception:
+            continue
+    if fallback_idx < len(entries):
+        return entries[fallback_idx]
+    return {}
+
+
+def post_header(icon, i, posts) -> str:
+    p = posts[i]
+    return (
+        f"{icon} Post {i + 1} · ❤️ {fmt(p['likes'])} · 💬 {fmt(p['comments_count'])}\n"
+        f"📝 «{short_caption(p['caption'])}»"
+    )
+
+
+def build_report(username, posts, report, best_idx, weak_idx):
     n = len(posts)
     likes = [p["likes"] for p in posts]
     comments = [p["comments_count"] for p in posts]
-    avg_likes = sum(likes) / n
-    avg_comments = sum(comments) / n
 
     score_line = ""
     if report["score"]:
         s = report["score"]
         score_line = f"⭐ Qiymət: {s}/10  {'▰' * s}{'▱' * (10 - s)}\n"
 
-    text = (
+    blocks = [
         f"📊 @{username} · PROFİL ANALİZİ\n"
         f"{LINE}\n"
         f"🏷 Niş: {report['niche']}\n"
         f"{score_line}"
         f"{LINE}\n\n"
-        f"❤️ Orta bəyənmə: {fmt(avg_likes)}\n"
-        f"💬 Orta şərh: {fmt(avg_comments)}\n"
-        f"🏆 Ən yaxşı post: {fmt(max(likes))} ❤️\n"
-        f"📉 Ən zəif post: {fmt(min(likes))} ❤️\n"
-        f"📝 Analiz olunan post: {n}\n"
-    )
+        f"❤️ Orta bəyənmə: {fmt(sum(likes) / n)}\n"
+        f"💬 Orta şərh: {fmt(sum(comments) / n)}\n"
+        f"📝 Analiz olunan post: {n}"
+    ]
+
     if report["summary"]:
-        text += f"\n📌 {report['summary']}\n"
-    text += "\n👇 Bölməni seç"
-    return text + author_line()
+        blocks.append(f"📌 XÜLASƏ\n{report['summary']}")
 
+    # --- Ən çox sevilən postlar ---
+    medals = ["🥇", "🥈", "🥉"]
+    entries = []
+    for pos, i in enumerate(best_idx):
+        e = find_entry(report["best"], i + 1, pos)
+        lines = [post_header(medals[pos] if pos < 3 else "🏅", i, posts)]
+        if e.get("why"):
+            lines.append(f"✅ Niyə sevildi: {e['why']}")
+        if e.get("repeat"):
+            lines.append(f"🔁 Təkrar et: {e['repeat']}")
+        entries.append("\n".join(lines))
+    if entries:
+        entries[0] = f"{LINE}\n🔥 ƏN ÇOX SEVİLƏN POSTLAR\n{LINE}\n\n" + entries[0]
+        blocks.extend(entries)
 
-def build_section(key: str, report) -> str:
-    title = next(t for k, _, t in SECTIONS if k == key)
-    items = report["sections"].get(key) or ["Məlumat yoxdur."]
-    body = "\n\n".join(f"▫️ {i}" for i in items)
-    return f"{title}\n{LINE}\n\n{body}\n\n👇 Başqa bölmə seç"
+    # --- Zəif postlar ---
+    entries = []
+    for pos, i in enumerate(weak_idx):
+        e = find_entry(report["weak"], i + 1, pos)
+        lines = [post_header("🔻", i, posts)]
+        if e.get("why"):
+            lines.append(f"⚠️ Niyə az sevildi: {e['why']}")
+        if e.get("fix"):
+            lines.append(f"🛠 Necə düzəltmək olar: {e['fix']}")
+        entries.append("\n".join(lines))
+    if entries:
+        entries[0] = f"{LINE}\n📉 ƏN ZƏİF POSTLAR\n{LINE}\n\n" + entries[0]
+        blocks.extend(entries)
+
+    # --- Siyahı bölmələri ---
+    for title, key in (
+        ("💬 AUDİTORİYA REAKSİYASI", "audience"),
+        ("📸 KONTENT STRATEGİYASI", "strategy"),
+        ("🤖 KÖMƏKÇİ MƏSLƏHƏTİ", "tips"),
+    ):
+        items = report[key]
+        if items:
+            body = "\n".join(f"▫️ {i}" for i in items)
+            blocks.append(f"{LINE}\n{title}\n{LINE}\n\n{body}")
+
+    footer = "👇 Aşağıdakı düymələrlə davam edə bilərsən"
+    author = author_line()
+    blocks.append(f"{footer}\n{author}" if author else footer)
+    return blocks
 
 
 # ---------------- Düymələr ----------------
-def section_rows(current=None):
-    buttons = [
-        InlineKeyboardButton(("✅ " if key == current else "") + label, callback_data=f"sec:{key}")
-        for key, label, _ in SECTIONS
-    ]
-    return [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-
-
-def tool_rows():
+def tools_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🆚 Rəqiblə müqayisə", callback_data="compare")],
         [
@@ -438,59 +528,45 @@ def tool_rows():
     if extra:
         rows.append(extra)
     rows.append([InlineKeyboardButton("🔄 Yeni profil analiz et", callback_data="new")])
-    return rows
-
-
-def home_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(section_rows() + tool_rows())
-
-
-def section_keyboard(current) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        section_rows(current) + [[InlineKeyboardButton("🏠 Xülasəyə qayıt", callback_data="home")]]
-    )
-
-
-def tools_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(tool_rows())
-
-
-def back_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📋 Analiz menyusu", callback_data="menu")],
-            [InlineKeyboardButton("🔄 Yeni profil analiz et", callback_data="new")],
-        ]
-    )
+    return InlineKeyboardMarkup(rows)
 
 
 # ---------------- Promptlar ----------------
-def analysis_prompt(username, posts):
+def analysis_prompt(username, posts, best_idx, weak_idx):
+    numbered = [{"post": i + 1, **p} for i, p in enumerate(posts)]
+    best_names = ", ".join(f"Post {i + 1}" for i in best_idx)
+    weak_names = ", ".join(f"Post {i + 1}" for i in weak_idx) or "yoxdur"
     return (
-        "Sən təcrübəli Sosial Media Analitiki və Strategisən.\n"
+        "Sən dost və köməkçi SMM asistanısan. İstifadəçiyə 'sən' deyə müraciət et, səmimi və konkret danış.\n"
         f"Aşağıda '@{username}' Instagram profilinin son {len(posts)} postunun məlumatları var:\n\n"
-        f"Məlumatlar:\n{json.dumps(posts, ensure_ascii=False)}\n\n"
+        f"{json.dumps(numbered, ensure_ascii=False)}\n\n"
+        f"Ən çox bəyənilən postlar: {best_names}.\n"
+        f"Ən zəif postlar: {weak_names}.\n\n"
         "Postların məzmunundan profilin nişini özün müəyyən et. "
-        "Heç bir sahəni əvvəlcədən fərz etmə, yalnız verilən məlumatlara əsaslan.\n\n"
+        "Heç bir sahəni əvvəlcədən fərz etmə, yalnız verilən məlumatlara əsaslan. "
+        "Səbəbləri izah edərkən caption-a, formata (video, foto, sitat), mövzuya və rəqəmlərə istinad et.\n\n"
         "Cavabı YALNIZ JSON formatında qaytar, başqa heç nə yazma:\n"
         "{\n"
         '  "niche": "profilin nişi, 2-4 söz",\n'
-        '  "score": 1-dən 10-a qədər tam ədəd (profilin ümumi performansı),\n'
+        '  "score": 1-dən 10-a qədər tam ədəd (ümumi performans),\n'
         '  "summary": "1-2 qısa cümləlik ümumi xülasə",\n'
-        '  "best": ["3 bənd: ən uğurlu postlar və səbəbi"],\n'
-        '  "weak": ["3 bənd: zəif postlar və səbəbi"],\n'
-        '  "audience": ["3 bənd: auditoriya reaksiyası"],\n'
-        '  "strategy": ["4 bənd: kontent və format strategiyası"],\n'
-        '  "tips": ["4 bənd: konkret tövsiyələr"]\n'
+        '  "best": [{"post": post nömrəsi, "why": "niyə çox sevildi, 1-2 qısa cümlə", '
+        '"repeat": "bunu necə təkrarlamaq olar, 1 qısa cümlə"}],\n'
+        '  "weak": [{"post": post nömrəsi, "why": "niyə az sevildi, 1-2 qısa cümlə", '
+        '"fix": "necə düzəltmək olar, 1 qısa cümlə"}],\n'
+        '  "audience": ["3 qısa bənd: auditoriya reaksiyası"],\n'
+        '  "strategy": ["3 qısa bənd: kontent və format strategiyası"],\n'
+        '  "tips": ["4 qısa bənd: köməkçi kimi birbaşa sənə müraciətlə konkret məsləhətlər"]\n'
         "}\n\n"
-        "Qaydalar: hər bənd maksimum 15 söz olsun, konkret olsun, mümkünsə post nömrəsi və rəqəm göstər. "
-        "Bəndlərdə markdown və emoji işlətmə."
+        "'best' massivində yalnız yuxarıdakı ən çox bəyənilən postlar, "
+        "'weak' massivində yalnız ən zəif postlar olsun. "
+        "Hər bənd maksimum 15 söz olsun. Mətndə markdown və emoji işlətmə."
     )
 
 
 def plan_prompt(username, posts):
     return (
-        "Sən Sosial Media Strategisən.\n"
+        "Sən dost və köməkçi Sosial Media Strategisən.\n"
         f"'@{username}' profilinin son postları:\n{json.dumps(posts, ensure_ascii=False)}\n\n"
         "Profilin nişini postlardan müəyyən et və hansı formatların daha yaxşı işlədiyini nəzərə alaraq "
         "30 günlük Instagram kontent planı hazırla.\n\n"
@@ -506,7 +582,7 @@ def plan_prompt(username, posts):
 
 def ideas_prompt(username, posts):
     return (
-        "Sən Reels və kontent ideyaları üzrə mütəxəssissən.\n"
+        "Sən Reels və kontent ideyaları üzrə köməkçi mütəxəssissən.\n"
         f"'@{username}' profilinin son postları:\n{json.dumps(posts, ensure_ascii=False)}\n\n"
         "Profilin nişini postlardan müəyyən et və ona uyğun 6 Reels/post ideyası ver.\n\n"
         "Hər ideya bu formatda olsun:\n"
@@ -519,7 +595,7 @@ def ideas_prompt(username, posts):
 
 def compare_prompt(u1, p1, u2, p2):
     return (
-        "Sən Sosial Media Analitikisən. İki Instagram profilini müqayisə et.\n\n"
+        "Sən köməkçi Sosial Media Analitikisən. İki Instagram profilini müqayisə et.\n\n"
         f"Profil 1: @{u1}\nOrta göstəricilər: {json.dumps(post_stats(p1), ensure_ascii=False)}\n"
         f"Postlar: {json.dumps(p1, ensure_ascii=False)}\n\n"
         f"Profil 2: @{u2}\nOrta göstəricilər: {json.dumps(post_stats(p2), ensure_ascii=False)}\n"
@@ -538,17 +614,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     if track_user(update.effective_user):
         await notify_admin(context, f"👤 Yeni istifadəçi: {who(update.effective_user)}")
-    await update.message.reply_text(
+    text = (
         "Salam! Mən AI Instagram Analitikiyəm. 📊\n"
         f"{LINE}\n\n"
         "Instagram profilinin istifadəçi adını (məsələn: sehife_adi) və ya linkini göndər.\n\n"
-        "Analizdən sonra düymələrlə:\n"
-        "▫️ Uğurlu və zəif postlara\n"
-        "▫️ Rəqib müqayisəsinə\n"
-        "▫️ Kontent planı və Reels ideyalarına\n"
-        "baxa bilərsən!"
-        + author_line()
+        "Mən sənə:\n"
+        "▫️ Ən çox sevilən postların niyə sevildiyini\n"
+        "▫️ Zəif postların niyə az sevildiyini\n"
+        "▫️ Nəyi necə düzəltməyi\n"
+        "izah edəcəyəm. Sonra rəqib müqayisəsi, kontent planı və Reels ideyaları da hazırlaya bilərəm!"
     )
+    if author_line():
+        text += f"\n\n{author_line()}"
+    await update.message.reply_text(text)
 
 
 async def stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -623,7 +701,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_raw_error(update.message, res2)
                 return
             text = await gemini_text(compare_prompt(main_user, main_posts, username, posts2))
-            await send_long(update.message, f"🆚 @{main_user} vs @{username}\n{LINE}\n\n{text}", back_keyboard())
+            await send_long(
+                update.message,
+                f"🆚 @{main_user} vs @{username}\n{LINE}\n\n{text}",
+                tools_keyboard(),
+            )
         except Exception as e:
             logging.exception("Müqayisə xətası")
             await update.message.reply_text(f"❌ Xəta baş verdi: {e}")
@@ -641,37 +723,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data["username"] = username
         context.user_data["posts"] = posts
-        context.user_data["report"] = None
 
         track_analysis(update.effective_user, username)
         await notify_admin(
             context, f"📊 Yeni analiz: {who(update.effective_user)} → @{username}"
         )
 
-        raw = await gemini_raw(analysis_prompt(username, posts))
+        best_idx, weak_idx = pick_posts(posts)
+        raw = await gemini_raw(analysis_prompt(username, posts, best_idx, weak_idx))
         report = parse_report(raw)
 
         if report:
-            card = build_card(username, posts, report)
-            context.user_data["report"] = {"card": card, "data": report}
-            await update.message.reply_text(card, reply_markup=home_keyboard())
+            blocks = build_report(username, posts, report, best_idx, weak_idx)
+            await send_blocks(update.message, blocks, tools_keyboard())
         else:
             # JSON alınmasa, təmizlənmiş mətnlə göstər
-            await send_long(
-                update.message, clean_text(raw) + author_line(), tools_keyboard()
-            )
+            text = clean_text(raw)
+            if author_line():
+                text += f"\n\n{author_line()}"
+            await send_long(update.message, text, tools_keyboard())
 
     except Exception as e:
         logging.exception("Xəta")
         await update.message.reply_text(f"❌ Xəta baş verdi: {e}")
-
-
-async def safe_edit(query, text, markup):
-    try:
-        await query.edit_message_text(text=text, reply_markup=markup)
-    except Exception as e:
-        # "message is not modified" kimi zərərsiz xətaları keç
-        logging.info("Edit keçildi: %s", e)
 
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -691,32 +765,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     username = context.user_data.get("username")
     posts = context.user_data.get("posts")
-    report = context.user_data.get("report")
     if not posts:
         await message.reply_text("Məlumat köhnəlib. Profil adını yenidən göndər.")
-        return
-
-    # --- Bölmələr (eyni mesajı dəyişir) ---
-    if action.startswith("sec:"):
-        key = action.split(":", 1)[1]
-        if not report:
-            await message.reply_text("Hesabat köhnəlib. Profil adını yenidən göndər.")
-            return
-        await safe_edit(query, build_section(key, report["data"]), section_keyboard(key))
-        return
-
-    if action == "home":
-        if not report:
-            await message.reply_text("Hesabat köhnəlib. Profil adını yenidən göndər.")
-            return
-        await safe_edit(query, report["card"], home_keyboard())
-        return
-
-    if action == "menu":
-        if not report:
-            await message.reply_text("Hesabat köhnəlib. Profil adını yenidən göndər.")
-            return
-        await message.reply_text(report["card"], reply_markup=home_keyboard())
         return
 
     if action == "compare":
@@ -737,7 +787,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = f"💡 REELS İDEYALARI · @{username}\n{LINE}\n\n{text}"
         else:
             return
-        await send_long(message, text, back_keyboard())
+        await send_long(message, text, tools_keyboard())
     except Exception as e:
         logging.exception("Düymə xətası")
         await message.reply_text(f"❌ Xəta baş verdi: {e}")
