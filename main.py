@@ -1,8 +1,8 @@
 import logging
 import os
 import threading
+import requests
 from flask import Flask
-import instaloader
 import google.generativeai as genai
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
@@ -24,6 +24,7 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 # Açar məlumatları
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
 
 # Gemini AI Konfiqurasiyası
 genai.configure(api_key=GEMINI_API_KEY)
@@ -45,34 +46,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         username = text.replace("@", "").strip()
         
-    await update.message.reply_text(f"🔎 '@{username}' profilinin son postları çəkilir və AI analiz edir. Xahiş olunur gözləyin...")
+    await update.message.reply_text(f"🔎 '@{username}' profilinin məlumatları çəkilir və AI analiz edir. Xahiş olunur gözləyin...")
     
     try:
-        L = instaloader.Instaloader(
-            download_pictures=False,
-            download_videos=False,
-            download_video_thumbnails=False,
-            max_connection_attempts=1
-        )
-        profile = instaloader.Profile.from_username(L.context, username)
+        # RapidAPI Instagram Scraper Sorğusu
+        url = "https://instagram-scraper-stable-api.p.rapidapi.com/get_ig_user_posts_v2.php"
         
-        posts_data = []
-        count = 0
-        
-        # Son 6 postu çəkirik (Bloklanmamaq və sürətli cavab üçün)
-        for post in profile.get_posts():
-            if count >= 6:
-                break
+        payload = f"username_or_url={username}"
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'x-rapidapi-host': 'instagram-scraper-stable-api.p.rapidapi.com',
+            'x-rapidapi-key': RAPIDAPI_KEY
+        }
 
-            posts_data.append({
-                "caption": post.caption or "",
-                "likes": post.likes,
-                "comments_count": post.comments
-            })
-            count += 1
+        api_response = requests.post(url, data=payload, headers=headers)
+        res_data = api_response.json()
+
+        posts_data = []
         
+        # Məlumatları təmizləyib struktura salırıq
+        items = res_data.get("data", {}).get("user", {}).get("edge_owner_to_timeline_media", {}).get("edges", [])
+        
+        for item in items[:6]:  # Son 6 post
+            node = item.get("node", {})
+            caption = ""
+            if node.get("edge_media_to_caption", {}).get("edges"):
+                caption = node["edge_media_to_caption"]["edges"][0]["node"].get("text", "")
+                
+            likes = node.get("edge_media_preview_like", {}).get("count", 0)
+            comments = node.get("edge_media_to_comment", {}).get("count", 0)
+            
+            posts_data.append({
+                "caption": caption,
+                "likes": likes,
+                "comments_count": comments
+            })
+
         if not posts_data:
-            await update.message.reply_text("❌ Bu profildə heç bir post tapılmadı və ya profil gizlidir (private).")
+            await update.message.reply_text("❌ Məlumat tapılmadı. Profil adının düzgün və açıq (public) olduğuna əmin olun.")
             return
 
         # AI Prompt
@@ -106,11 +117,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         - Müştəriləri DM-ə çəkmək və satışı bağlamaq üçün 1-2 taktika ver.
         """
         
-        response = model.generate_content(prompt)
-        await update.message.reply_text(response.text)
+        ai_response = model.generate_content(prompt)
+        await update.message.reply_text(ai_response.text)
 
     except Exception as e:
-        await update.message.reply_text(f"❌ Xəta baş verdi: Profilin açıq (public) olduğuna əmin olun. Əlavə xəta: {e}")
+        await update.message.reply_text(f"❌ Xəta baş verdi: {e}")
 
 if __name__ == '__main__':
     # Veb serveri arxa fonda başladırıq
