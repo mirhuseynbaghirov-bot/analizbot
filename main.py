@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 
 import requests
@@ -137,6 +138,21 @@ def parse_post(item):
     }
 
 
+def clean_text(text: str) -> str:
+    """Gemini yenə də markdown yazsa, Telegram üçün təmizləyir."""
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped in ("---", "***", "___"):
+            continue
+        stripped = re.sub(r"^#{1,6}\s*", "", stripped)          # ### başlıqlar
+        stripped = re.sub(r"^[\*\-]\s+", "• ", stripped)          # * və - siyahılar
+        stripped = stripped.replace("**", "").replace("__", "").replace("`", "")
+        lines.append(stripped)
+    result = "\n".join(lines)
+    return re.sub(r"\n{3,}", "\n\n", result).strip()
+
+
 async def send_long(update: Update, text: str):
     """Telegram 4096 simvol limitinə görə hissə-hissə göndər."""
     for i in range(0, len(text), 4000):
@@ -146,9 +162,9 @@ async def send_long(update: Update, text: str):
 # ---------------- Bot handlerləri ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Salam! Mən Sənin Ətir Mağazası üçün AI Sosial Media Analitikisəm. 🧪\n\n"
+        "Salam! Mən AI Instagram Analitikiyəm. 📊\n\n"
         "Instagram profilinin istifadəçi adını (məsələn: sehife_adi) və ya linkini göndər.\n"
-        "Mən son postları, bəyənmələri və şərhləri analiz edib sənə stok, reklam və kontent məsləhəti verim!"
+        "Mən son postları, bəyənmələri və şərhləri analiz edib sənə kontent və böyümə məsləhəti verim!"
     )
 
 
@@ -175,20 +191,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         prompt = (
-            "Sən təcrübəli Lüks Ətir Mağazası Biznes Konsultantı və Sosial Media Strategisən.\n"
-            f"Aşağıda Instagram profilinin son {len(posts_data)} postunun məlumatları var:\n\n"
+            "Sən təcrübəli Sosial Media Analitiki və Strategisən.\n"
+            f"Aşağıda '@{username}' Instagram profilinin son {len(posts_data)} postunun məlumatları var:\n\n"
             f"Məlumatlar:\n{json.dumps(posts_data, ensure_ascii=False)}\n\n"
-            "Bu göstəriciləri əsas götürərək, mağaza sahibinə aydın və dəqiq hesabat hazırla:\n\n"
-            "🔥 1. TOP MƏHSUL (Ən Çox Bəyənilən Və İstənilən Ətir)\n"
-            "📉 2. ZƏİF PERFORMANSLI MƏHSUL\n"
-            "💬 3. MÜŞTƏRİ TƏLƏBİ VƏ İŞTİRAK ANALİZİ\n"
-            "📦 4. STOK VƏ SİFARİŞ MƏSLƏHƏTİ\n"
+            "Əvvəlcə postların məzmunundan profilin nişini (sahəsini) özün müəyyən et. "
+            "Heç bir sahəni əvvəlcədən fərz etmə, yalnız verilən məlumatlara əsaslan.\n"
+            "Sonra aşağıdakı bölmələrlə qısa, aydın və konkret hesabat yaz:\n\n"
+            "📌 1. PROFİL XÜLASƏSİ (niş və ümumi təəssürat)\n"
+            "🔥 2. ƏN UĞURLU POSTLAR (bəyənmə və şərhlə)\n"
+            "📉 3. ZƏİF POSTLAR VƏ SƏBƏBLƏRİ\n"
+            "💬 4. AUDİTORİYA REAKSİYASI\n"
             "📸 5. KONTENT VƏ FORMAT STRATEGİYASI\n"
-            "💡 6. XÜSUSİ BİZNES TÖVSİYƏLƏRİ"
+            "💡 6. TÖVSİYƏLƏR\n\n"
+            "FORMAT QAYDALARI (çox vacib):\n"
+            "- Cavab Telegram üçün SADƏ MƏTN olmalıdır.\n"
+            "- Markdown işlətmə: #, ##, ###, **, *, ---, ``` qadağandır.\n"
+            "- Bölmə başlıqlarını yuxarıdakı emoji ilə və BÖYÜK hərflə yaz.\n"
+            "- Siyahı üçün yalnız '• ' işarəsini işlət.\n"
+            "- Bölmələr arasında boş sətir burax. Giriş və çıxış salamlaması yazma."
         )
 
         ai_response = await asyncio.to_thread(model.generate_content, prompt)
-        await send_long(update, ai_response.text)
+        await send_long(update, clean_text(ai_response.text))
 
     except Exception as e:
         logging.exception("Xəta")
