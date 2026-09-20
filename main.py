@@ -2,6 +2,7 @@ import logging
 import os
 import threading
 import requests
+import json
 from flask import Flask
 import google.generativeai as genai
 from telegram import Update
@@ -66,9 +67,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user = res_data["data"].get("user", {})
                 timeline = user.get("edge_owner_to_timeline_media", {})
                 items = timeline.get("edges", [])
-            elif "items" in res_data:
+            elif "items" in res_data and isinstance(res_data["items"], list):
                 items = res_data.get("items", [])
-            elif "edges" in res_data:
+            elif "edges" in res_data and isinstance(res_data["edges"], list):
                 items = res_data.get("edges", [])
 
         for item in items[:6]:
@@ -91,38 +92,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "comments_count": comments
             })
 
+        # Məlumat tapılmadıqda API-dən gələn xətanı istifadəçiyə göstəririk
         if not posts_data:
-            await update.message.reply_text("❌ Məlumat strukturlaşdırıla bilmədi. Zəhmət olmasa başqa istifadəçi adı ilə yoxlayın.")
-            return
-
-        prompt = f"""
-        Sən təcrübəli Lüks Ətir Mağazası Biznes Konsultantı və Sosial Media Strategisən.
-        Aşağıda Instagram profilinin son {len(posts_data)} postunun məlumatları var:
-        
-        Məlumatlar:
-        {posts_data}
-        
-        Bu göstəriciləri əsas götürərək, mağaza sahibinə aydın və dəqiq hesabat hazırla:
-
-        🔥 1. TOP MƏHSUL (Ən Çox Bəyənilən Və İstənilən Ətir)
-        📉 2. ZƏİF PERFORMANSLI MƏHSUL
-        💬 3. MÜŞTƏRİ TƏLƏBİ VƏ İŞTİRAK ANALİZİ
-        📦 4. STOK VƏ SİFARİŞ MƏSLƏHƏTİ
-        📸 5. KONTENT VƏ FORMAT STRATEGİYASI
-        💡 6. XÜSUSİ BİZNES TÖVSİYƏLƏRİ
-        """
-        
-        ai_response = model.generate_content(prompt)
-        await update.message.reply_text(ai_response.text)
-
-    except Exception as e:
-        await update.message.reply_text(f"❌ Xəta baş verdi: {e}")
-
-if __name__ == '__main__':
-    threading.Thread(target=run_flask, daemon=True).start()
-    
-    tg_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    tg_app.add_handler(CommandHandler("start", start))
-    tg_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    
-    tg_app.run_polling()
+            err_msg = json.dumps(res_data, indent=2)[:3000]
+            await update.message.reply_text(f"⚠️ API Cavabı:\n```json\n{err_msg}\n
