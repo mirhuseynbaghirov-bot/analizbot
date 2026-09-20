@@ -34,28 +34,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Mən son postları, bəyənmələri və şərhləri analiz edib sənə stok, reklam və kontent məsləhəti verim!"
     )
 
-def extract_posts(data):
-    """Müxtəlif API strukturlarından post siyahısını tapır"""
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        # 1. Standart data -> user -> edges
-        if "data" in data and isinstance(data["data"], dict):
-            user = data["data"].get("user", {})
-            if "edge_owner_to_timeline_media" in user:
-                return user["edge_owner_to_timeline_media"].get("edges", [])
-            if "posts" in user:
-                return user.get("posts", [])
-            if "items" in user:
-                return user.get("items", [])
-        
-        # 2. Birbaşa açarlar
-        for key in ["items", "edges", "posts", "data", "results"]:
-            if key in data and isinstance(data[key], list):
-                return data[key]
-                
-    return []
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     
@@ -67,34 +45,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🔎 '@{username}' profilinin məlumatları çəkilir və AI analiz edir. Xahiş olunur gözləyin...")
     
     try:
-        url = "https://instagram-scraper-stable-api.p.rapidapi.com/user_posts.php"
-        querystring = {"username_or_id_or_url": username}
+        # Stabil və yenilənmiş API endpointi
+        url = f"https://instagram-scraper-stable-api.p.rapidapi.com/v1/posts?username_or_id_or_url={username}"
         
         headers = {
             'x-rapidapi-host': 'instagram-scraper-stable-api.p.rapidapi.com',
             'x-rapidapi-key': RAPIDAPI_KEY
         }
 
-        api_response = requests.get(url, headers=headers, params=querystring)
+        api_response = requests.get(url, headers=headers)
         res_data = api_response.json()
 
-        items = extract_posts(res_data)
         posts_data = []
+        items = []
+
+        if isinstance(res_data, dict):
+            if "data" in res_data and isinstance(res_data["data"], list):
+                items = res_data["data"]
+            elif "items" in res_data and isinstance(res_data["items"], list):
+                items = res_data["items"]
+            elif "data" in res_data and isinstance(res_data["data"], dict):
+                items = res_data["data"].get("items", [])
 
         for item in items[:6]:
-            node = item.get("node", item) if isinstance(item, dict) else {}
-            
             caption = ""
-            if "edge_media_to_caption" in node and node["edge_media_to_caption"].get("edges"):
-                caption = node["edge_media_to_caption"]["edges"][0]["node"].get("text", "")
-            elif "caption" in node:
-                if isinstance(node["caption"], dict):
-                    caption = node["caption"].get("text", "")
-                elif isinstance(node["caption"], str):
-                    caption = node["caption"]
+            if "caption" in item and isinstance(item["caption"], dict):
+                caption = item["caption"].get("text", "")
+            elif "caption" in item and isinstance(item["caption"], str):
+                caption = item["caption"]
 
-            likes = node.get("edge_media_preview_like", {}).get("count", node.get("like_count", node.get("likes", 0)))
-            comments = node.get("edge_media_to_comment", {}).get("count", node.get("comment_count", node.get("comments", 0)))
+            likes = item.get("like_count", item.get("likes", 0))
+            comments = item.get("comment_count", item.get("comments", 0))
             
             posts_data.append({
                 "caption": caption,
@@ -103,10 +84,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             })
 
         if not posts_data:
-            # Əgər yenə məlumat çıxara bilməsə, API-dən nə gəldiyini Telegram-a atır ki, strukturunu görək
-            keys_info = list(res_data.keys()) if isinstance(res_data, dict) else str(type(res_data))
             preview = json.dumps(res_data, indent=2)[:1500]
-            await update.message.reply_text(f"⚠️ Məlumat strukturu uyğun gəlmədi.\n\nAPI Açarları: `{keys_info}`\n\nGələn Cavab:\n```json\n{preview}\n```", parse_mode='Markdown')
+            await update.message.reply_text(f"⚠️ Məlumat strukturu çəkilə bilmədi.\n\nAPI Cavabı:\n```json\n{preview}\n```", parse_mode='Markdown')
             return
 
         prompt = (
