@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import threading
+from urllib.parse import quote
 
 import requests
 import google.generativeai as genai
@@ -49,6 +50,56 @@ RAPIDAPI_METHOD = os.environ.get("RAPIDAPI_METHOD", "POST").upper()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel(GEMINI_MODEL)
+
+# ---------------- Müəllif məlumatları (Render > Environment) ----------------
+AUTHOR_NAME = os.environ.get("AUTHOR_NAME", "").strip()
+AUTHOR_TELEGRAM = os.environ.get("AUTHOR_TELEGRAM", "").strip().lstrip("@")
+AUTHOR_INSTAGRAM = os.environ.get("AUTHOR_INSTAGRAM", "").strip().lstrip("@")
+CHANNEL_URL = os.environ.get("CHANNEL_URL", "").strip()
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "").strip().lstrip("@")
+
+
+def author_line() -> str:
+    """Mətnin sonuna əlavə olunan müəllif sətri."""
+    if not (AUTHOR_NAME or AUTHOR_TELEGRAM):
+        return ""
+    line = "\n\n👨‍💻 Hazırlayan: " + (AUTHOR_NAME or f"@{AUTHOR_TELEGRAM}")
+    if AUTHOR_NAME and AUTHOR_TELEGRAM:
+        line += f" (@{AUTHOR_TELEGRAM})"
+    return line
+
+
+def author_link_buttons():
+    rows = []
+    if CHANNEL_URL:
+        rows.append([InlineKeyboardButton("📢 Telegram kanalı", url=CHANNEL_URL)])
+    if AUTHOR_INSTAGRAM:
+        rows.append(
+            [InlineKeyboardButton("📸 Instagram", url=f"https://instagram.com/{AUTHOR_INSTAGRAM}")]
+        )
+    if AUTHOR_TELEGRAM:
+        rows.append([InlineKeyboardButton("💬 Müəllifə yaz", url=f"https://t.me/{AUTHOR_TELEGRAM}")])
+    return rows
+
+
+def about_text() -> str:
+    who = AUTHOR_NAME or (f"@{AUTHOR_TELEGRAM}" if AUTHOR_TELEGRAM else "müəllif")
+    return (
+        "👨‍💻 BOT HAQQINDA\n\n"
+        f"Bu bot {who} tərəfindən SMM mütəxəssisləri və biznes sahibləri üçün hazırlanıb.\n\n"
+        "Instagram profillərini AI ilə analiz edir, rəqib müqayisəsi, kontent planı və Reels ideyaları verir.\n\n"
+        "Rəy, təklif və ya yeni bot sifarişi üçün müəllifə yaza bilərsən. Yeniliklər kanalda paylaşılır. 👇"
+    )
+
+
+def share_url() -> str:
+    text = "Instagram profilini AI ilə pulsuz analiz edən bot 📊"
+    return (
+        "https://t.me/share/url?url="
+        + quote(f"https://t.me/{BOT_USERNAME}")
+        + "&text="
+        + quote(text)
+    )
 
 FORMAT_RULES = (
     "\n\nFORMAT QAYDALARI (çox vacib):\n"
@@ -197,16 +248,24 @@ async def send_long(message, text: str, reply_markup=None):
 
 
 def result_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+    rows = [
+        [InlineKeyboardButton("🆚 Rəqiblə müqayisə", callback_data="compare")],
         [
-            [InlineKeyboardButton("🆚 Rəqiblə müqayisə", callback_data="compare")],
-            [
-                InlineKeyboardButton("📅 30 günlük plan", callback_data="plan"),
-                InlineKeyboardButton("💡 Reels ideyaları", callback_data="ideas"),
-            ],
-            [InlineKeyboardButton("🔄 Yeni profil analiz et", callback_data="new")],
-        ]
-    )
+            InlineKeyboardButton("📅 30 günlük plan", callback_data="plan"),
+            InlineKeyboardButton("💡 Reels ideyaları", callback_data="ideas"),
+        ],
+    ]
+
+    extra = []
+    if AUTHOR_NAME or AUTHOR_TELEGRAM or AUTHOR_INSTAGRAM or CHANNEL_URL:
+        extra.append(InlineKeyboardButton("👨‍💻 Bot müəllifi", callback_data="author"))
+    if BOT_USERNAME:
+        extra.append(InlineKeyboardButton("👥 Dostuna göndər", url=share_url()))
+    if extra:
+        rows.append(extra)
+
+    rows.append([InlineKeyboardButton("🔄 Yeni profil analiz et", callback_data="new")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ---------------- Promptlar ----------------
@@ -272,7 +331,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Salam! Mən AI Instagram Analitikiyəm. 📊\n\n"
         "Instagram profilinin istifadəçi adını (məsələn: sehife_adi) və ya linkini göndər.\n"
         "Analizdən sonra düymələrlə rəqib müqayisəsi, kontent planı və Reels ideyaları ala bilərsən!"
+        + author_line()
     )
+
+
+async def send_about(message):
+    rows = author_link_buttons()
+    await message.reply_text(about_text(), reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+
+
+async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_about(update.message)
 
 
 async def show_raw_error(message, res_data):
@@ -322,7 +391,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["posts"] = posts
 
         text = await gemini_text(analysis_prompt(username, posts))
-        await send_long(update.message, text, result_keyboard())
+        await send_long(update.message, text + author_line(), result_keyboard())
 
     except Exception as e:
         logging.exception("Xəta")
@@ -338,6 +407,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "new":
         context.user_data["awaiting_compare"] = False
         await message.reply_text("Yeni profilin istifadəçi adını və ya linkini göndər. 👇")
+        return
+
+    if action == "author":
+        await send_about(message)
         return
 
     username = context.user_data.get("username")
@@ -373,6 +446,7 @@ if __name__ == "__main__":
 
     tg_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     tg_app.add_handler(CommandHandler("start", start))
+    tg_app.add_handler(CommandHandler("haqqinda", about))
     tg_app.add_handler(CallbackQueryHandler(handle_button))
     tg_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
