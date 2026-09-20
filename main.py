@@ -38,7 +38,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     
     if "instagram.com" in text:
-        username = text.split("instagram.com/")[ -1].replace("/", "").split("?")[0].strip()
+        username = text.split("instagram.com/")[-1].replace("/", "").split("?")[0].strip()
     else:
         username = text.replace("@", "").strip()
         
@@ -60,7 +60,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         posts_data = []
         
-        # Müxtəlif JSON strukturlarını yoxlayırıq
         items = []
         if isinstance(res_data, dict):
             if "data" in res_data and isinstance(res_data["data"], dict):
@@ -92,7 +91,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "comments_count": comments
             })
 
-        # Məlumat tapılmadıqda API-dən gələn xətanı istifadəçiyə göstəririk
         if not posts_data:
             err_msg = json.dumps(res_data, indent=2)[:3000]
-            await update.message.reply_text(f"⚠️ API Cavabı:\n```json\n{err_msg}\n
+            await update.message.reply_text(f"⚠️ RapidAPI Cavabı:\n\n{err_msg}")
+            return
+
+        prompt = (
+            "Sən təcrübəli Lüks Ətir Mağazası Biznes Konsultantı və Sosial Media Strategisən.\n"
+            f"Aşağıda Instagram profilinin son {len(posts_data)} postunun məlumatları var:\n\n"
+            f"Məlumatlar:\n{posts_data}\n\n"
+            "Bu göstəriciləri əsas götürərək, mağaza sahibinə aydın və dəqiq hesabat hazırla:\n\n"
+            "🔥 1. TOP MƏHSUL (Ən Çox Bəyənilən Və İstənilən Ətir)\n"
+            "📉 2. ZƏİF PERFORMANSLI MƏHSUL\n"
+            "💬 3. MÜŞTƏRİ TƏLƏBİ VƏ İŞTİRAK ANALİZİ\n"
+            "📦 4. STOK VƏ SİFARİŞ MƏSLƏHƏTİ\n"
+            "📸 5. KONTENT VƏ FORMAT STRATEGİYASI\n"
+            "💡 6. XÜSUSİ BİZNES TÖVSİYƏLƏRİ"
+        )
+        
+        ai_response = model.generate_content(prompt)
+        await update.message.reply_text(ai_response.text)
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Xəta baş verdi: {e}")
+
+if __name__ == '__main__':
+    threading.Thread(target=run_flask, daemon=True).start()
+    
+    tg_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    tg_app.add_handler(CommandHandler("start", start))
+    tg_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    
+    tg_app.run_polling()
