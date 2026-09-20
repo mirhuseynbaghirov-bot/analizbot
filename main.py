@@ -40,7 +40,8 @@ RAPIDAPI_PARAM = os.environ.get("RAPIDAPI_PARAM", "username_or_url")
 RAPIDAPI_METHOD = os.environ.get("RAPIDAPI_METHOD", "POST").upper()
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+model = genai.GenerativeModel(GEMINI_MODEL)
 
 
 # ---------------- Köməkçi funksiyalar ----------------
