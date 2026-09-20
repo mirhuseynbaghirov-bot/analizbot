@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import threading
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
@@ -53,6 +54,12 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel(GEMINI_MODEL)
 
+# Limit və keş
+DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "3"))
+CACHE_HOURS = float(os.environ.get("CACHE_HOURS", "12"))
+ADMIN_UNLIMITED = os.environ.get("ADMIN_UNLIMITED", "1") == "1"
+BAKU = timezone(timedelta(hours=4))  # limit Bakı vaxtı ilə gecə 00:00-da yenilənir
+
 # ---------------- Müəllif məlumatları ----------------
 AUTHOR_NAME = os.environ.get("AUTHOR_NAME", "").strip()
 AUTHOR_TELEGRAM = os.environ.get("AUTHOR_TELEGRAM", "").strip().lstrip("@")
@@ -98,6 +105,28 @@ def about_text() -> str:
     )
 
 
+def privacy_text() -> str:
+    return (
+        "🔒 MƏXFİLİK VƏ ŞƏRTLƏR\n"
+        f"{LINE}\n\n"
+        "📥 Nə analiz olunur:\n"
+        "▫️ Yalnız açıq (public) Instagram profillərinin postları\n"
+        "▫️ Məlumat üçüncü tərəf xidmət (API) vasitəsilə çəkilir\n"
+        "▫️ Analiz üçün Google Gemini AI istifadə olunur\n\n"
+        "💾 Nə saxlanılır:\n"
+        "▫️ Telegram ID-n və istifadəçi adın\n"
+        "▫️ Analiz etdiyin profillərin adları və vaxtı\n"
+        "▫️ Gündəlik limit sayğacı\n"
+        f"▫️ Analiz nəticələri təxminən {CACHE_HOURS:g} saat yaddaşda qalır, sonra silinir\n\n"
+        "🚫 Nə edilmir:\n"
+        "▫️ Məlumatların üçüncü şəxslərə satılması\n"
+        "▫️ Bağlı (private) profillərə çıxış\n\n"
+        "⚠️ Qeyd:\n"
+        "▫️ AI nəticələri məsləhət xarakterlidir, nəticə zəmanəti vermir\n"
+        "▫️ Məlumatlarının silinməsi üçün müəllifə yaza bilərsən"
+    )
+
+
 def share_url() -> str:
     text = "Instagram profilini AI ilə pulsuz analiz edən bot 📊"
     return (
@@ -108,7 +137,7 @@ def share_url() -> str:
     )
 
 
-# ---------------- Statistika ----------------
+# ---------------- Statistika və limit sayğacı ----------------
 ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
 STATS_FILE = os.environ.get("STATS_FILE", "stats.json")
 _stats_lock = threading.Lock()
@@ -118,11 +147,12 @@ def _load_stats():
     try:
         with open(STATS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            data.setdefault("users", {})
-            data.setdefault("analyses", [])
-            return data
     except Exception:
-        return {"users": {}, "analyses": []}
+        data = {}
+    data.setdefault("users", {})
+    data.setdefault("analyses", [])
+    data.setdefault("usage", {})
+    return data
 
 
 STATS = _load_stats()
@@ -173,13 +203,120 @@ async def notify_admin(context, text: str):
         logging.exception("Admin bildirişi göndərilmədi")
 
 
+def is_admin(user) -> bool:
+    return bool(ADMIN_ID) and str(user.id) == ADMIN_ID
+
+
+def is_unlimited(user) -> bool:
+    return ADMIN_UNLIMITED and is_admin(user)
+
+
+def _today() -> str:
+    return datetime.now(BAKU).strftime("%Y-%m-%d")
+
+
+def used_today(user) -> int:
+    with _stats_lock:
+        u = STATS["usage"].get(str(user.id))
+        if u and u.get("d") == _today():
+            return int(u.get("n", 0))
+        return 0
+
+
+def remaining(user) -> int:
+    return max(0, DAILY_LIMIT - used_today(user))
+
+
+def add_usage(user):
+    """Analizdən ƏVVƏL limiti rezerv edir (paralel sorğularla keçilməsin deyə)."""
+    with _stats_lock:
+        u = STATS["usage"].get(str(user.id))
+        if not u or u.get("d") != _today():
+            u = {"d": _today(), "n": 0}
+        u["n"] += 1
+        STATS["usage"][str(user.id)] = u
+        _save_stats()
+
+
+def refund_usage(user):
+    """Analiz alınmadısa (xəta, post yoxdur) limiti geri qaytarır."""
+    with _stats_lock:
+        u = STATS["usage"].get(str(user.id))
+        if u and u.get("d") == _today() and u.get("n", 0) > 0:
+            u["n"] -= 1
+            _save_stats()
+
+
+def quota_line(user) -> str:
+    if is_unlimited(user):
+        return ""
+    return f"🎟 Bu gün qalan analiz: {remaining(user)}/{DAILY_LIMIT}"
+
+
+async def check_limit(message, user) -> bool:
+    if is_unlimited(user) or remaining(user) > 0:
+        return True
+    rows = author_link_buttons()
+    await message.reply_text(
+        "⛔ GÜNDƏLİK LİMİT DOLDU\n"
+        f"{LINE}\n\n"
+        f"Bu gün {DAILY_LIMIT} analiz hüququndan istifadə etdin.\n"
+        "🕛 Limit hər gecə 00:00-da (Bakı vaxtı) yenilənir.\n\n"
+        "Daha çox analiz lazımdırsa, müəllifə yaza bilərsən. 👇",
+        reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+    )
+    return False
+
+
+# ---------------- Keş (eyni profil təkrar sorğulananda xərc getməsin) ----------------
+_CACHE = {}
+_CACHE_MAX = 300
+
+
+def cache_get(username: str):
+    key = username.lower()
+    entry = _CACHE.get(key)
+    if not entry:
+        return None
+    if time.time() - entry["t"] > CACHE_HOURS * 3600:
+        _CACHE.pop(key, None)
+        return None
+    return entry
+
+
+def cache_put(username: str, posts, raw=None):
+    if len(_CACHE) >= _CACHE_MAX:
+        oldest = min(_CACHE, key=lambda k: _CACHE[k]["t"])
+        _CACHE.pop(oldest, None)
+    _CACHE[username.lower()] = {"t": time.time(), "posts": posts, "raw": raw}
+
+
+def cache_set_raw(username: str, raw: str):
+    entry = _CACHE.get(username.lower())
+    if entry:
+        entry["raw"] = raw
+
+
 # ---------------- Instagram məlumatı ----------------
+USERNAME_RE = re.compile(r"[A-Za-z0-9._]{1,30}")
+
+
+class ApiError(Exception):
+    def __init__(self, kind, detail=""):
+        super().__init__(f"{kind}: {detail}")
+        self.kind = kind
+
+
 def extract_username(text: str) -> str:
     text = text.strip()
     if "instagram.com" in text:
         text = text.split("instagram.com/")[-1]
         text = text.split("?")[0].strip("/").split("/")[0]
     return text.replace("@", "").strip()
+
+
+def valid_username(username: str) -> bool:
+    return bool(USERNAME_RE.fullmatch(username or ""))
 
 
 def call_rapidapi(username: str) -> dict:
@@ -196,10 +333,18 @@ def call_rapidapi(username: str) -> dict:
     else:
         resp = requests.get(url, headers=headers, params=payload, timeout=45)
 
+    code = resp.status_code
+    if code == 429:
+        raise ApiError("quota", resp.text[:200])
+    if code in (401, 403):
+        raise ApiError("auth", resp.text[:200])
+    if code >= 500:
+        raise ApiError("server", resp.text[:200])
+
     try:
         return resp.json()
     except Exception:
-        return {"status_code": resp.status_code, "text": resp.text[:500]}
+        return {"status_code": code, "text": resp.text[:300]}
 
 
 def find_post_list(data):
@@ -265,9 +410,16 @@ def parse_post(item):
 
 
 async def fetch_posts(username: str):
+    """Əvvəl keşə baxır, yoxdursa API-yə sorğu göndərir."""
+    entry = cache_get(username)
+    if entry and entry.get("posts"):
+        return entry["posts"], {}
+
     res_data = await asyncio.to_thread(call_rapidapi, username)
     items = find_post_list(res_data)
     posts = [p for p in (parse_post(i) for i in items[:6]) if p]
+    if posts:
+        cache_put(username, posts)
     return posts, res_data
 
 
@@ -278,6 +430,60 @@ def post_stats(posts):
         "orta_bəyənmə": round(sum(p["likes"] for p in posts) / n),
         "orta_şərh": round(sum(p["comments_count"] for p in posts) / n),
     }
+
+
+# ---------------- Xəta mesajları ----------------
+def user_error(e):
+    """(istifadəçiyə mesaj, adminə qeyd) qaytarır. Texniki detal istifadəçiyə göstərilmir."""
+    if isinstance(e, ApiError):
+        if e.kind == "quota":
+            return (
+                "⏳ Bot hazırda çox yüklənib. Bir neçə dəqiqədən sonra yenidən yoxla.",
+                "🚨 RapidAPI limiti bitib (429). Planı yoxla!",
+            )
+        if e.kind == "auth":
+            return (
+                "🛠 Bot hazırda texniki işdədir. Bir az sonra yenidən yoxla.",
+                f"🚨 RapidAPI açar/abunə xətası (401/403): {e}",
+            )
+        return (
+            "⚠️ Instagram məlumat xidməti hazırda cavab vermir. Bir az sonra yenidən yoxla.",
+            f"🚨 RapidAPI server xətası: {e}",
+        )
+    if isinstance(e, requests.exceptions.RequestException):
+        return ("🌐 Bağlantı xətası oldu. Bir az sonra yenidən yoxla.", None)
+    return (
+        "🤖 AI hazırda cavab verə bilmədi. Bir az sonra yenidən yoxla.",
+        f"🚨 Xəta: {type(e).__name__}: {str(e)[:300]}",
+    )
+
+
+async def handle_error(context, message, e, where: str):
+    logging.exception("Xəta (%s)", where)
+    text, note = user_error(e)
+    await message.reply_text(text)
+    if note:
+        await notify_admin(context, f"{note}\n(yer: {where})")
+
+
+async def no_posts(context, message, user, username, res_data):
+    """Post tapılmayanda istifadəçiyə səliqəli izah verir."""
+    logging.info("Post tapılmadı: %s | %s", username, str(res_data)[:300])
+    await message.reply_text(
+        f"😕 @{username} üçün post tapılmadı\n"
+        f"{LINE}\n\n"
+        "Ən çox rast gəlinən səbəblər:\n"
+        "▫️ Profil bağlıdır (private)\n"
+        "▫️ İstifadəçi adı səhv yazılıb\n"
+        "▫️ Profildə hələ post yoxdur\n\n"
+        "Yoxla və yenidən yaz. Bu cəhd limitindən çıxılmadı. 👇"
+    )
+    # API özü xəta mesajı qaytarıbsa (məs. endpoint səhvdir), adminə bildir
+    if isinstance(res_data, dict) and ("message" in res_data or "error" in res_data):
+        preview = json.dumps(res_data, ensure_ascii=False)[:400]
+        await notify_admin(context, f"⚠️ API cavabı (@{username}):\n{preview}")
+        if is_admin(user):
+            await message.reply_text(f"🔧 (Admin üçün) API cavabı:\n{preview}")
 
 
 # ---------------- Mətn təmizləmə və Gemini ----------------
@@ -323,7 +529,7 @@ async def send_blocks(message, blocks, reply_markup=None, limit=3900):
         block = block.strip()
         if not block:
             continue
-        while len(block) > limit:  # çox nadir: tək blok limiti keçirsə
+        while len(block) > limit:
             if current:
                 chunks.append(current)
                 current = ""
@@ -383,11 +589,7 @@ def _clean_list(value, limit):
 def _clean_entries(value):
     if not isinstance(value, list):
         return []
-    out = []
-    for e in value:
-        if isinstance(e, dict):
-            out.append(e)
-    return out
+    return [e for e in value if isinstance(e, dict)]
 
 
 def parse_report(text: str):
@@ -441,7 +643,7 @@ def post_header(icon, i, posts) -> str:
     )
 
 
-def build_report(username, posts, report, best_idx, weak_idx):
+def build_report(username, posts, report, best_idx, weak_idx, quota=""):
     n = len(posts)
     likes = [p["likes"] for p in posts]
     comments = [p["comments_count"] for p in posts]
@@ -465,7 +667,6 @@ def build_report(username, posts, report, best_idx, weak_idx):
     if report["summary"]:
         blocks.append(f"📌 XÜLASƏ\n{report['summary']}")
 
-    # --- Ən çox sevilən postlar ---
     medals = ["🥇", "🥈", "🥉"]
     entries = []
     for pos, i in enumerate(best_idx):
@@ -480,7 +681,6 @@ def build_report(username, posts, report, best_idx, weak_idx):
         entries[0] = f"{LINE}\n🔥 ƏN ÇOX SEVİLƏN POSTLAR\n{LINE}\n\n" + entries[0]
         blocks.extend(entries)
 
-    # --- Zəif postlar ---
     entries = []
     for pos, i in enumerate(weak_idx):
         e = find_entry(report["weak"], i + 1, pos)
@@ -494,7 +694,6 @@ def build_report(username, posts, report, best_idx, weak_idx):
         entries[0] = f"{LINE}\n📉 ƏN ZƏİF POSTLAR\n{LINE}\n\n" + entries[0]
         blocks.extend(entries)
 
-    # --- Siyahı bölmələri ---
     for title, key in (
         ("💬 AUDİTORİYA REAKSİYASI", "audience"),
         ("📸 KONTENT STRATEGİYASI", "strategy"),
@@ -505,9 +704,12 @@ def build_report(username, posts, report, best_idx, weak_idx):
             body = "\n".join(f"▫️ {i}" for i in items)
             blocks.append(f"{LINE}\n{title}\n{LINE}\n\n{body}")
 
-    footer = "👇 Aşağıdakı düymələrlə davam edə bilərsən"
-    author = author_line()
-    blocks.append(f"{footer}\n{author}" if author else footer)
+    footer = ["👇 Aşağıdakı düymələrlə davam edə bilərsən"]
+    if quota:
+        footer.append(quota)
+    if author_line():
+        footer.append(author_line())
+    blocks.append("\n".join(footer))
     return blocks
 
 
@@ -622,15 +824,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "▫️ Ən çox sevilən postların niyə sevildiyini\n"
         "▫️ Zəif postların niyə az sevildiyini\n"
         "▫️ Nəyi necə düzəltməyi\n"
-        "izah edəcəyəm. Sonra rəqib müqayisəsi, kontent planı və Reels ideyaları da hazırlaya bilərəm!"
+        "izah edəcəyəm. Sonra rəqib müqayisəsi, kontent planı və Reels ideyaları da hazırlaya bilərəm!\n\n"
+        f"🎟 Gündə {DAILY_LIMIT} pulsuz analiz hüququn var (/limit)\n"
+        "ℹ️ Yalnız açıq (public) profillər analiz olunur. Məxfilik: /mexfilik"
     )
     if author_line():
         text += f"\n\n{author_line()}"
     await update.message.reply_text(text)
 
 
+async def limit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if is_unlimited(user):
+        await update.message.reply_text("♾ Admin kimi limitin yoxdur.")
+        return
+    await update.message.reply_text(
+        f"🎟 Bu gün qalan analiz: {remaining(user)}/{DAILY_LIMIT}\n"
+        "🕛 Limit hər gecə 00:00-da (Bakı vaxtı) yenilənir."
+    )
+
+
+async def privacy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(privacy_text())
+
+
 async def stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not ADMIN_ID or str(update.effective_user.id) != ADMIN_ID:
+    if not is_admin(update.effective_user):
         return
 
     now = datetime.now(timezone.utc)
@@ -657,7 +876,8 @@ async def stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🆕 Son 7 gündə yeni: {len(new_week)}\n\n"
         f"📊 Ümumi analiz: {len(analyses)}\n"
         f"🕐 Son 24 saat: {len(day)} analiz, {len({a['u'] for a in day})} nəfər\n"
-        f"📅 Son 7 gün: {len(week)} analiz, {len({a['u'] for a in week})} nəfər\n\n"
+        f"📅 Son 7 gün: {len(week)} analiz, {len({a['u'] for a in week})} nəfər\n"
+        f"🗂 Keşdə profil: {len(_CACHE)}\n\n"
         f"🔝 Ən çox analiz edilən profillər:\n{top_text}"
     )
 
@@ -671,18 +891,19 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_about(update.message)
 
 
-async def show_raw_error(message, res_data):
-    preview = json.dumps(res_data, indent=2, ensure_ascii=False)[:1500]
-    await message.reply_text(f"⚠️ API cavabından post tapılmadı:\n\n{preview}")
-
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if track_user(update.effective_user):
-        await notify_admin(context, f"👤 Yeni istifadəçi: {who(update.effective_user)}")
+    user = update.effective_user
+    if track_user(user):
+        await notify_admin(context, f"👤 Yeni istifadəçi: {who(user)}")
 
     username = extract_username(update.message.text)
-    if not username:
-        await update.message.reply_text("İstifadəçi adı tapılmadı. Yenidən yaz.")
+    if not valid_username(username):
+        await update.message.reply_text(
+            "🤔 Bu düzgün Instagram istifadəçi adı deyil.\n\n"
+            "Nümunə:\n"
+            "▫️ sehife_adi\n"
+            "▫️ instagram.com/sehife_adi"
+        )
         return
 
     # --- Rəqib müqayisəsi rejimi ---
@@ -693,59 +914,76 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not main_posts:
             await update.message.reply_text("Əvvəlcə əsas profili analiz et.")
             return
+        if not await check_limit(update.message, user):
+            return
 
+        add_usage(user)
         await update.message.reply_text(f"🆚 '@{username}' ilə müqayisə edilir. Gözləyin...")
         try:
             posts2, res2 = await fetch_posts(username)
             if not posts2:
-                await show_raw_error(update.message, res2)
+                refund_usage(user)
+                await no_posts(context, update.message, user, username, res2)
                 return
             text = await gemini_text(compare_prompt(main_user, main_posts, username, posts2))
+            q = quota_line(user)
             await send_long(
                 update.message,
-                f"🆚 @{main_user} vs @{username}\n{LINE}\n\n{text}",
+                f"🆚 @{main_user} vs @{username}\n{LINE}\n\n{text}" + (f"\n\n{q}" if q else ""),
                 tools_keyboard(),
             )
         except Exception as e:
-            logging.exception("Müqayisə xətası")
-            await update.message.reply_text(f"❌ Xəta baş verdi: {e}")
+            refund_usage(user)
+            await handle_error(context, update.message, e, "müqayisə")
         return
 
     # --- Adi analiz ---
+    if not await check_limit(update.message, user):
+        return
+
+    add_usage(user)
     await update.message.reply_text(
         f"🔎 '@{username}' profilinin məlumatları çəkilir və AI analiz edir. Xahiş olunur gözləyin..."
     )
     try:
         posts, res_data = await fetch_posts(username)
         if not posts:
-            await show_raw_error(update.message, res_data)
+            refund_usage(user)
+            await no_posts(context, update.message, user, username, res_data)
             return
 
         context.user_data["username"] = username
         context.user_data["posts"] = posts
 
-        track_analysis(update.effective_user, username)
-        await notify_admin(
-            context, f"📊 Yeni analiz: {who(update.effective_user)} → @{username}"
-        )
+        track_analysis(user, username)
+        await notify_admin(context, f"📊 Yeni analiz: {who(user)} → @{username}")
 
         best_idx, weak_idx = pick_posts(posts)
-        raw = await gemini_raw(analysis_prompt(username, posts, best_idx, weak_idx))
+
+        entry = cache_get(username)
+        raw = entry.get("raw") if entry else None
+        if not raw:
+            raw = await gemini_raw(analysis_prompt(username, posts, best_idx, weak_idx))
         report = parse_report(raw)
 
         if report:
-            blocks = build_report(username, posts, report, best_idx, weak_idx)
+            cache_set_raw(username, raw)
+            blocks = build_report(
+                username, posts, report, best_idx, weak_idx, quota=quota_line(user)
+            )
             await send_blocks(update.message, blocks, tools_keyboard())
         else:
-            # JSON alınmasa, təmizlənmiş mətnlə göstər
             text = clean_text(raw)
+            q = quota_line(user)
+            if q:
+                text += f"\n\n{q}"
             if author_line():
                 text += f"\n\n{author_line()}"
             await send_long(update.message, text, tools_keyboard())
 
     except Exception as e:
-        logging.exception("Xəta")
-        await update.message.reply_text(f"❌ Xəta baş verdi: {e}")
+        refund_usage(user)
+        await handle_error(context, update.message, e, "analiz")
 
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -776,6 +1014,14 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if action in ("plan", "ideas"):
+        # spam və təsadüfi ikiqat basılmaya qarşı qısa gözləmə
+        now = time.time()
+        if now - context.user_data.get("last_ai", 0) < 15:
+            await message.reply_text("⏳ Əvvəlki sorğu hələ hazırlanır, bir az gözlə.")
+            return
+        context.user_data["last_ai"] = now
+
     try:
         if action == "plan":
             await message.reply_text("📅 30 günlük plan hazırlanır...")
@@ -789,8 +1035,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await send_long(message, text, tools_keyboard())
     except Exception as e:
-        logging.exception("Düymə xətası")
-        await message.reply_text(f"❌ Xəta baş verdi: {e}")
+        context.user_data["last_ai"] = 0
+        await handle_error(context, message, e, action)
 
 
 if __name__ == "__main__":
@@ -799,6 +1045,8 @@ if __name__ == "__main__":
     tg_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(CommandHandler("haqqinda", about))
+    tg_app.add_handler(CommandHandler("limit", limit_cmd))
+    tg_app.add_handler(CommandHandler("mexfilik", privacy_cmd))
     tg_app.add_handler(CommandHandler("stat", stat))
     tg_app.add_handler(CallbackQueryHandler(handle_button))
     tg_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
