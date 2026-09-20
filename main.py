@@ -45,37 +45,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🔎 '@{username}' profilinin məlumatları çəkilir və AI analiz edir. Xahiş olunur gözləyin...")
     
     try:
-        # Stabil və yenilənmiş API endpointi
-        url = f"https://instagram-scraper-stable-api.p.rapidapi.com/v1/posts?username_or_id_or_url={username}"
+        # RapidAPI-nin dəqiq kök URL-i
+        url = "https://instagram-scraper-stable-api.p.rapidapi.com/"
+        
+        payload = {
+            "username_or_id_or_url": username
+        }
         
         headers = {
-            'x-rapidapi-host': 'instagram-scraper-stable-api.p.rapidapi.com',
-            'x-rapidapi-key': RAPIDAPI_KEY
+            "content-type": "application/x-www-form-urlencoded",
+            "x-rapidapi-host": "instagram-scraper-stable-api.p.rapidapi.com",
+            "x-rapidapi-key": RAPIDAPI_KEY
         }
 
-        api_response = requests.get(url, headers=headers)
+        api_response = requests.post(url, data=payload, headers=headers)
         res_data = api_response.json()
 
         posts_data = []
         items = []
 
+        # JSON strukturlarını təhlil et
         if isinstance(res_data, dict):
-            if "data" in res_data and isinstance(res_data["data"], list):
-                items = res_data["data"]
+            if "data" in res_data:
+                d = res_data["data"]
+                if isinstance(d, list):
+                    items = d
+                elif isinstance(d, dict):
+                    items = d.get("items", d.get("user", {}).get("edge_owner_to_timeline_media", {}).get("edges", []))
             elif "items" in res_data and isinstance(res_data["items"], list):
                 items = res_data["items"]
-            elif "data" in res_data and isinstance(res_data["data"], dict):
-                items = res_data["data"].get("items", [])
 
         for item in items[:6]:
+            node = item.get("node", item) if isinstance(item, dict) else {}
+            
             caption = ""
-            if "caption" in item and isinstance(item["caption"], dict):
-                caption = item["caption"].get("text", "")
-            elif "caption" in item and isinstance(item["caption"], str):
-                caption = item["caption"]
+            if "caption" in node:
+                if isinstance(node["caption"], dict):
+                    caption = node["caption"].get("text", "")
+                elif isinstance(node["caption"], str):
+                    caption = node["caption"]
+            elif "edge_media_to_caption" in node and node["edge_media_to_caption"].get("edges"):
+                caption = node["edge_media_to_caption"]["edges"][0]["node"].get("text", "")
 
-            likes = item.get("like_count", item.get("likes", 0))
-            comments = item.get("comment_count", item.get("comments", 0))
+            likes = node.get("like_count", node.get("edge_media_preview_like", {}).get("count", 0))
+            comments = node.get("comment_count", node.get("edge_media_to_comment", {}).get("count", 0))
             
             posts_data.append({
                 "caption": caption,
@@ -85,7 +98,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not posts_data:
             preview = json.dumps(res_data, indent=2)[:1500]
-            await update.message.reply_text(f"⚠️ Məlumat strukturu çəkilə bilmədi.\n\nAPI Cavabı:\n```json\n{preview}\n```", parse_mode='Markdown')
+            await update.message.reply_text(f"⚠️ API-dən gələn datanın cavabı:\n```json\n{preview}\n```", parse_mode='Markdown')
             return
 
         prompt = (
